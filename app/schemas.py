@@ -551,3 +551,56 @@ class SegmentResponse(BaseModel):
     expression: SegmentExpr
     created_at: Any
     updated_at: Any
+
+
+# ---------------------------------------------------------------------------
+# 实验曝光归因
+# ---------------------------------------------------------------------------
+
+
+class ExposureCreateRequest(BaseModel):
+    """记录一次实验曝光：把已存在判定快照的结果固化为曝光记录。
+
+    ``exposure_id`` 为客户端幂等键：同一 exposure_id 重试返回首次记录；
+    复用该 ID 指向另一判定快照（request_id 不同）返回 409。
+    """
+
+    exposure_id: str = Field(
+        min_length=1, max_length=64, description="客户端幂等键；重试须与首次请求一致"
+    )
+    request_id: str = Field(
+        min_length=1, max_length=64, description="已存在的判定 request_id（判定快照）"
+    )
+
+
+class ExposureResponse(BaseModel):
+    """一条已固化的曝光记录。"""
+
+    exposure_id: str
+    request_id: str
+    flag_key: str
+    user_id: str
+    config_version: int
+    variant_key: str
+    decided_at: datetime = Field(description="原判定时间（UTC），从判定快照固化")
+    exposed_at: datetime = Field(description="曝光记录落库时间（UTC）")
+
+
+class ExposureSummaryGroup(BaseModel):
+    """按 (config_version, variant_key) 分组的一组曝光汇总。"""
+
+    config_version: int
+    variant_key: str
+    unique_users: int = Field(description="该分组内去重用户数")
+    exposures: int = Field(description="该分组内曝光记录数")
+
+
+class ExposureSummaryResponse(BaseModel):
+    """单个开关的曝光汇总（按带时区起止时间筛选曝光落库时间）。"""
+
+    flag_key: str
+    exposed_from: datetime | None = Field(description="实际生效的筛选下界（UTC）；未提供为 null")
+    exposed_to: datetime | None = Field(description="实际生效的筛选上界（UTC）；未提供为 null")
+    total_exposures: int = Field(description="筛选范围内曝光记录总数")
+    unique_users: int = Field(description="筛选范围内跨分组去重后的用户总数")
+    groups: list[ExposureSummaryGroup]

@@ -23,6 +23,8 @@
 - POST /api/v1/evaluate           判定（flag_key 在请求体中）
 - GET  /api/v1/decisions          判定快照审计列表（不透明游标分页 + 组合过滤）
 - GET  /api/v1/decisions/{request_id}     按 request_id 查询单条判定快照
+- POST /api/v1/exposures          记录实验曝光（固化判定快照；exposure_id 幂等）
+- GET  /api/v1/flags/{flag_key}/exposure-summary  曝光汇总（按 config_version × variant_key）
 - GET  /healthz                   健康检查
 """
 
@@ -31,7 +33,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -46,6 +48,10 @@ from app.schemas import (
     DecisionListResponse,
     EvaluateRequest,
     EvaluateResponse,
+    ExposureCreateRequest,
+    ExposureResponse,
+    ExposureSummaryGroup,
+    ExposureSummaryResponse,
     FlagResponse,
     FlagUpsertRequest,
     FlagVersionResponse,
@@ -941,3 +947,143 @@ def get_decision(request_id: str, db: Session = Depends(get_db)):
             status_code=status.HTTP_404_NOT_FOUND, detail=f"未找到 request_id={request_id} 的判定快照"
         )
     return _snapshot_to_response(snap)
+
+
+# ---------------------------------------------------------------------------
+# 实验曝光归因
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/v1/exposures",
+    response_model=ExposureResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_exposure(
+    payload: ExposureCreateRequest, response: Response, db: Session = Depends(get_db)
+):
+    """把一次已存在的判定固化为实验曝光记录。
+
+    - ``request_id`` 对应的判定快照不存在返回 ``404``；存在时把快照的
+      flag_key / user_id / config_version / variant_key 与原判定时间
+      decided_at 一并固化（之后的配置更新、快照变化均不影响本记录）；
+    - ``exposure_id`` 为幂等键：同一 exposure_id + 同一 request_id 的重试
+      返回 ``200`` 与首次记录；复用该 ID 指向另一快照（request_id 不同）
+      返回 ``409``；
+    - 曝光记录只增不删，删除开关不影响历史曝光。
+    """
+    existing = crud.get_exposure(db, payload.exposure_id)
+    if existing is not None:
+        if existing.request_id != payload.request_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"exposure_id={payload.exposure_id} 已用于其他判定快照"
+                    f"（request_id 不一致）"
+                ),
+            )
+        # 幂等重试：返回首次记录
+        response.status_code = status.HTTP_200_OK
+        return crud.exposure_to_response(existing)
+
+    snapshot = crud.get_snapshot(db, payload.request_id)
+    if snapshot is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"未找到 request_id={payload.request_id} 的判定快照",
+        )
+
+    try:
+        exposure = crud.create_exposure(
+            db, exposure_id=payload.exposure_id, snapshot=snapshot
+        )
+    except IntegrityError:
+        # 并发下 exposure_id 唯一键冲突：回退到已存在的曝光记录
+        db.rollback()
+        existing = crud.get_exposure(db, payload.exposure_id)
+        if existing is not None:
+            if existing.request_id != payload.request_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"exposure_id={payload.exposure_id} 已用于其他判定快照"
+                        f"（request_id 不一致）"
+                    ),
+                )
+            response.status_code = status.HTTP_200_OK
+            return crud.exposure_to_response(existing)
+        raise
+    return crud.exposure_to_response(exposure)
+
+
+@app.get(
+    "/api/v1/flags/{flag_key}/exposure-summary",
+    response_model=ExposureSummaryResponse,
+)
+def exposure_summary(
+    flag_key: str,
+    exposed_from: str | None = Query(
+        default=None, description="曝光落库时间下界（含），ISO 8601 且带时区"
+    ),
+    exposed_to: str | None = Query(
+        default=None, description="曝光落库时间上界（含），ISO 8601 且带时区"
+    ),
+    db: Session = Depends(get_db),
+) -> ExposureSummaryResponse:
+    """按 (config_version, variant_key) 汇总指定开关的去重用户数与曝光数。
+
+    - ``exposed_from`` / ``exposed_to`` 可选，必须是**带时区**的 ISO 8601
+      时间（接受 ``Z`` 或 ``+08:00`` 等偏移，统一转 UTC 后按曝光落库时间
+      ``exposed_at`` 过滤，边界均含）；不带时区、格式非法或区间倒置返回 ``422``；
+    - ``groups`` 按 (config_version, variant_key) 升序返回，各组含去重用户数
+      与曝光数；顶层 ``unique_users`` 为跨分组去重后的用户总数（同一用户
+      出现在多个分组只计一次）；
+    - 开关不存在或已删除同样返回 ``200``（删除开关不删除历史曝光），无
+      曝光时各计数为 0、``groups`` 为空。
+    """
+
+    def _parse_dt(name: str, raw: str) -> datetime:
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{name} 必须是 ISO 8601 时间，例如 2026-09-18T08:00:00Z",
+            ) from exc
+        if dt.tzinfo is None or dt.utcoffset() is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{name} 必须带时区，例如 2026-09-18T08:00:00Z",
+            )
+        return dt.astimezone(timezone.utc)
+
+    aware_from = _parse_dt("exposed_from", exposed_from) if exposed_from is not None else None
+    aware_to = _parse_dt("exposed_to", exposed_to) if exposed_to is not None else None
+    if aware_from is not None and aware_to is not None and aware_from > aware_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="时间区间倒置：exposed_from 不得晚于 exposed_to",
+        )
+
+    # 统一成 naive UTC 比较，与 SQLAlchemy 从 SQLite 读出的 exposed_at 形态一致
+    dt_from = aware_from.replace(tzinfo=None) if aware_from is not None else None
+    dt_to = aware_to.replace(tzinfo=None) if aware_to is not None else None
+    groups, total_exposures, unique_users = crud.summarize_exposures(
+        db, flag_key=flag_key, exposed_from=dt_from, exposed_to=dt_to
+    )
+    return ExposureSummaryResponse(
+        flag_key=flag_key,
+        exposed_from=aware_from,
+        exposed_to=aware_to,
+        total_exposures=total_exposures,
+        unique_users=unique_users,
+        groups=[
+            ExposureSummaryGroup(
+                config_version=g.config_version,
+                variant_key=g.variant_key,
+                unique_users=g.unique_users,
+                exposures=g.exposures,
+            )
+            for g in groups
+        ],
+    )

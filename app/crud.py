@@ -11,6 +11,7 @@ from app import engine as eng
 from app import segments as seg
 from app.models import (
     DecisionSnapshot,
+    Exposure,
     FlagConfig,
     FlagConfigVersion,
     FlagOverride,
@@ -890,3 +891,91 @@ def release_to_response(batch: ReleaseBatch) -> dict:
         "created_at": _utc_aware(batch.created_at),
         "committed_at": _utc_aware(batch.committed_at) if batch.committed_at else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# 实验曝光归因
+# ---------------------------------------------------------------------------
+
+
+def get_exposure(db: Session, exposure_id: str) -> Exposure | None:
+    return db.scalar(select(Exposure).where(Exposure.exposure_id == exposure_id))
+
+
+def create_exposure(
+    db: Session, *, exposure_id: str, snapshot: DecisionSnapshot
+) -> Exposure:
+    """把判定快照固化为一条曝光记录。
+
+    exposure_id 为幂等键（唯一约束兜底并发写入）；flag_key / user_id /
+    config_version / variant_key 与原判定时间 decided_at 从快照原样复制，
+    之后的配置更新、快照变化都不影响本记录。
+    """
+    exposure = Exposure(
+        exposure_id=exposure_id,
+        request_id=snapshot.request_id,
+        flag_key=snapshot.flag_key,
+        user_id=snapshot.user_id,
+        config_version=snapshot.config_version,
+        variant_key=snapshot.variant_key,
+        decided_at=snapshot.decided_at,
+    )
+    db.add(exposure)
+    db.commit()
+    db.refresh(exposure)
+    return exposure
+
+
+def exposure_to_response(exposure: Exposure) -> dict:
+    """序列化为 ExposureResponse；naive UTC 统一补回 tzinfo（输出带 Z）。"""
+    return {
+        "exposure_id": exposure.exposure_id,
+        "request_id": exposure.request_id,
+        "flag_key": exposure.flag_key,
+        "user_id": exposure.user_id,
+        "config_version": exposure.config_version,
+        "variant_key": exposure.variant_key,
+        "decided_at": _utc_aware(exposure.decided_at),
+        "exposed_at": _utc_aware(exposure.exposed_at),
+    }
+
+
+def summarize_exposures(
+    db: Session,
+    *,
+    flag_key: str,
+    exposed_from: datetime | None = None,
+    exposed_to: datetime | None = None,
+) -> tuple[list, int, int]:
+    """按 (config_version, variant_key) 汇总去重用户数与曝光数，并给出总计。
+
+    时间筛选作用于曝光落库时间 exposed_at（调用方已规范化为 naive UTC）；
+    边界均为含。返回 (分组行, 总曝光数, 跨分组去重用户数)——总计单独聚合，
+    因为同一用户可能出现在多个分组，分组去重数之和不等于全局去重数。
+    开关已删除时历史曝光仍参与汇总（删除开关不删除曝光）。
+    """
+
+    def _filtered(stmt):
+        stmt = stmt.where(Exposure.flag_key == flag_key)
+        if exposed_from is not None:
+            stmt = stmt.where(Exposure.exposed_at >= exposed_from)
+        if exposed_to is not None:
+            stmt = stmt.where(Exposure.exposed_at <= exposed_to)
+        return stmt
+
+    groups = db.execute(
+        _filtered(
+            select(
+                Exposure.config_version,
+                Exposure.variant_key,
+                func.count().label("exposures"),
+                func.count(func.distinct(Exposure.user_id)).label("unique_users"),
+            )
+        )
+        .group_by(Exposure.config_version, Exposure.variant_key)
+        .order_by(Exposure.config_version, Exposure.variant_key)
+    ).all()
+    total_exposures, unique_users = db.execute(
+        _filtered(select(func.count(), func.count(func.distinct(Exposure.user_id))))
+    ).one()
+    return groups, total_exposures, unique_users
