@@ -381,6 +381,61 @@ class DecisionListResponse(BaseModel):
     next_cursor: str | None = Field(description="下一页不透明游标；末页为 null")
 
 
+# ---------------------------------------------------------------------------
+# 实验曝光归因
+# ---------------------------------------------------------------------------
+
+
+class ExposureCreateRequest(BaseModel):
+    """记录一次实验曝光：把已存在的判定快照固化为曝光记录。
+
+    ``exposure_id`` 为客户端生成的幂等键：同一 exposure_id 重试返回首次
+    结果；复用该 ID 指向另一 request_id 返回 409。
+    """
+
+    exposure_id: str = Field(
+        min_length=1, max_length=64, description="曝光幂等键，由客户端生成"
+    )
+    request_id: str = Field(
+        min_length=1, max_length=64, description="已存在的判定 request_id"
+    )
+
+
+class ExposureResponse(BaseModel):
+    """一条固化的曝光记录（首次创建与幂等重放同结构）。"""
+
+    exposure_id: str
+    request_id: str
+    flag_key: str
+    user_id: str
+    config_version: int
+    variant_key: str
+    decided_at: datetime = Field(description="原判定时间（UTC），从判定快照固化")
+    created_at: datetime = Field(description="曝光记录创建时间（UTC）")
+
+
+class ExposureSummaryRow(BaseModel):
+    """按 (config_version, variant_key) 汇总的一组曝光指标。"""
+
+    config_version: int
+    variant_key: str
+    unique_users: int = Field(description="该组去重用户数")
+    exposures: int = Field(description="该组曝光记录数")
+
+
+class ExposureSummaryResponse(BaseModel):
+    """某开关在给定时间窗内的曝光汇总（按版本与变体分组）。"""
+
+    flag_key: str
+    decided_from: datetime | None = Field(
+        description="实际生效的原判定时间下界（UTC，含）；未提供为 null"
+    )
+    decided_to: datetime | None = Field(
+        description="实际生效的原判定时间上界（UTC，含）；未提供为 null"
+    )
+    rows: list[ExposureSummaryRow]
+
+
 class PreviewUser(BaseModel):
     """发布前影响预览的单个评估对象。"""
 

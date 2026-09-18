@@ -5,12 +5,14 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from sqlalchemy import delete, func, inspect, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import engine as eng
 from app import segments as seg
 from app.models import (
     DecisionSnapshot,
+    Exposure,
     FlagConfig,
     FlagConfigVersion,
     FlagOverride,
@@ -52,6 +54,10 @@ class VersionNotFound(Exception):
 
 class VersionConflict(Exception):
     """expected_current_version 与实际当前版本不一致（期望版本已过期）。"""
+
+
+class ExposureConflict(Exception):
+    """exposure_id 已被用于指向另一判定快照（request_id 不一致）。"""
 
 
 def serialize_config_body(payload: FlagConfigBody) -> tuple[str, str, str | None]:
@@ -221,6 +227,7 @@ def delete_flag(db: Session, flag_key: str) -> bool:
     db.execute(delete(FlagConfigVersion).where(FlagConfigVersion.flag_key == flag_key))
     # 按用户强制变体一并删除；重建后的同名开关不带任何 override
     db.execute(delete(FlagOverride).where(FlagOverride.flag_key == flag_key))
+    # 判定快照与曝光记录不随开关删除：审计回查与实验归因保留历史
     db.delete(flag)
     db.commit()
     return True
@@ -543,6 +550,108 @@ def list_snapshots(
         DecisionSnapshot.decided_at.desc(), DecisionSnapshot.request_id.desc()
     ).limit(limit + 1)
     return db.scalars(stmt).all()
+
+
+# ---------------------------------------------------------------------------
+# 实验曝光归因
+# ---------------------------------------------------------------------------
+
+
+def get_exposure(db: Session, exposure_id: str) -> Exposure | None:
+    return db.scalar(select(Exposure).where(Exposure.exposure_id == exposure_id))
+
+
+def create_exposure(
+    db: Session, *, exposure_id: str, snapshot: DecisionSnapshot
+) -> tuple[Exposure, bool]:
+    """把判定快照固化为一条曝光记录；返回 (记录, 是否本次新建)。
+
+    快照存在性（404）由路由层先校验。幂等语义：
+    - exposure_id 已存在且指向同一 request_id：直接返回首次记录（重试安全）；
+    - exposure_id 已存在但指向其他 request_id：抛 ExposureConflict（-> 409）；
+    - 并发下 exposure_id 唯一键冲突：回滚后按同一规则回退到已存在记录。
+    """
+    existing = get_exposure(db, exposure_id)
+    if existing is not None:
+        if existing.request_id != snapshot.request_id:
+            raise ExposureConflict(
+                f"exposure_id={exposure_id} 已用于其他判定（request_id 不一致）"
+            )
+        return existing, False
+    exposure = Exposure(
+        exposure_id=exposure_id,
+        request_id=snapshot.request_id,
+        flag_key=snapshot.flag_key,
+        user_id=snapshot.user_id,
+        config_version=snapshot.config_version,
+        variant_key=snapshot.variant_key,
+        decided_at=snapshot.decided_at,
+    )
+    db.add(exposure)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发写入同一 exposure_id：回退到已存在的记录，同样按 request_id 核对
+        db.rollback()
+        existing = get_exposure(db, exposure_id)
+        if existing is not None and existing.request_id == snapshot.request_id:
+            return existing, False
+        raise ExposureConflict(
+            f"exposure_id={exposure_id} 已用于其他判定（request_id 不一致）"
+        )
+    db.refresh(exposure)
+    return exposure, True
+
+
+def summarize_exposures(
+    db: Session,
+    *,
+    flag_key: str,
+    decided_from: datetime | None = None,
+    decided_to: datetime | None = None,
+) -> list[dict]:
+    """按 (config_version, variant_key) 汇总某开关的曝光：去重用户数 + 曝光数。
+
+    时间窗按曝光记录固化的原判定时间 decided_at 过滤（含边界，naive UTC）；
+    结果按 (config_version, variant_key) 升序返回。开关已删除时历史曝光
+    仍参与汇总（删除开关不删除曝光）。
+    """
+    stmt = select(
+        Exposure.config_version,
+        Exposure.variant_key,
+        func.count(func.distinct(Exposure.user_id)),
+        func.count(),
+    ).where(Exposure.flag_key == flag_key)
+    if decided_from is not None:
+        stmt = stmt.where(Exposure.decided_at >= decided_from)
+    if decided_to is not None:
+        stmt = stmt.where(Exposure.decided_at <= decided_to)
+    stmt = stmt.group_by(Exposure.config_version, Exposure.variant_key).order_by(
+        Exposure.config_version, Exposure.variant_key
+    )
+    return [
+        {
+            "config_version": config_version,
+            "variant_key": variant_key,
+            "unique_users": unique_users,
+            "exposures": exposures,
+        }
+        for config_version, variant_key, unique_users, exposures in db.execute(stmt).all()
+    ]
+
+
+def exposure_to_response(exposure: Exposure) -> dict:
+    """序列化为 ExposureResponse；naive UTC 补回 tzinfo（输出带时区）。"""
+    return {
+        "exposure_id": exposure.exposure_id,
+        "request_id": exposure.request_id,
+        "flag_key": exposure.flag_key,
+        "user_id": exposure.user_id,
+        "config_version": exposure.config_version,
+        "variant_key": exposure.variant_key,
+        "decided_at": _utc_aware(exposure.decided_at),
+        "created_at": _utc_aware(exposure.created_at),
+    }
 
 
 # ---------------------------------------------------------------------------

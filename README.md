@@ -14,6 +14,7 @@
 - 支持**按用户的临时强制变体（override）**：未指定 `config_version` 时优先于规则与分桶，可带过期时间，到期 / 变体被移除后自动失效；
 - 判定响应包含**命中规则、分桶值、最终变体的完整解释链**；
 - 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**；
+- 支持**实验曝光归因**：把判定快照的 `flag_key` / `user_id` / `config_version` / `variant_key` 与原判定时间固化为不可变曝光记录（`exposure_id` 幂等），并按版本与变体汇总去重用户数与曝光数；删除开关不删除历史曝光；
 - 支持**多开关发布批次**：一次提交多个开关的候选配置并逐开关生成影响预览（不改动当前配置），提交时在单一事务内再核对全部版本，任一冲突整体回滚 `409`、绝不部分写入，重复提交幂等返回首次结果；
 - 支持**受众分群（segments）**：用可嵌套的 `all` / `any` / `not` 表达式组合属性比较条件，并允许引用其他分群（判定时递归解析）；开关规则新增 `segment` 操作符直接引用分群。保存分群检测直接 / 间接循环引用（`422`）；被引用的分群禁止更新 / 删除（`409`），保证既有判定（含历史版本重放）不静默变化。
 
@@ -105,6 +106,8 @@ curl -sS -X POST http://localhost:8000/api/v1/segments \
 | `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中） |
 | `GET` | `/api/v1/decisions` | 判定快照审计列表（组合过滤 + 不透明游标分页） |
 | `GET` | `/api/v1/decisions/{request_id}` | 按 request_id 查询单条判定快照 |
+| `POST` | `/api/v1/exposures` | 把判定快照固化为实验曝光记录（`exposure_id` 幂等；快照不存在 `404`；复用 ID 指向另一快照 `409`） |
+| `GET` | `/api/v1/flags/{flag_key}/exposure-summary` | 按版本与变体汇总曝光（带时区时间窗筛选；去重用户数 + 曝光数） |
 | `GET` | `/healthz` | 健康检查 |
 
 ### 创建开关
@@ -638,6 +641,65 @@ curl -sS 'http://localhost:8000/api/v1/decisions?flag_key=btn_color&user_id=alic
 - 首页请求发起时冻结高水位（最大快照 id），**翻页期间新写入的快照不会进入后续页**，页与页之间是一个稳定快照视图；重新从首页开始则能看到最新数据；
 - 服务重启后旧游标失效（按损坏处理，返回 `422`），重新取首页即可。
 
+### 实验曝光归因
+
+实验分析需要把"用户实际看到了哪个变体"与判定结果对齐。客户端在判定返回后上报曝光：`POST /api/v1/exposures` 按 `request_id` 找到判定快照，把快照的 `flag_key` / `user_id` / `config_version` / `variant_key` 与**原判定时间** `decided_at` 固化为一条不可变曝光记录——之后开关更新、回滚、删除或快照变化都不影响已固化的曝光。
+
+```bash
+# 1) 先判定，拿到 request_id（也可自行指定 request_id 便于幂等）
+curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"user-1001","context":{"region":"cn"},"request_id":"req-0001"}'
+
+# 2) 上报曝光：exposure_id 为客户端生成的幂等键
+curl -sS -X POST http://localhost:8000/api/v1/exposures \
+  -H 'Content-Type: application/json' \
+  -d '{"exposure_id":"exp-0001","request_id":"req-0001"}'
+```
+
+响应（首次创建返回 `201`）：
+
+```json
+{
+  "exposure_id": "exp-0001",
+  "request_id": "req-0001",
+  "flag_key": "btn_color",
+  "user_id": "user-1001",
+  "config_version": 1,
+  "variant_key": "red",
+  "decided_at": "2026-09-18T08:00:00Z",
+  "created_at": "2026-09-18T08:00:01Z"
+}
+```
+
+行为约定：
+
+- `request_id` 对应的判定快照不存在返回 `404`；`exposure_id` / `request_id` 缺失或为空返回 `422`；
+- **幂等**：同一 `exposure_id` 重试（网络超时重发等）返回**首次记录**，状态码 `200`，不产生新记录；复用该 `exposure_id` 指向**另一个** `request_id` 返回 `409`；
+- 曝光记录只增不删：**删除开关不会删除历史曝光**，已删除开关的曝光仍参与汇总；判定快照不随开关删除，因此开关删除后仍可基于留存快照补记曝光。
+
+**曝光汇总**：`GET /api/v1/flags/{flag_key}/exposure-summary` 按 `(config_version, variant_key)` 分组，返回每组的去重用户数与曝光数：
+
+```bash
+curl -sS 'http://localhost:8000/api/v1/flags/btn_color/exposure-summary?decided_from=2026-09-18T00:00:00%2B08:00&decided_to=2026-09-19T00:00:00Z'
+```
+
+```json
+{
+  "flag_key": "btn_color",
+  "decided_from": "2026-09-17T16:00:00Z",
+  "decided_to": "2026-09-19T00:00:00Z",
+  "rows": [
+    {"config_version": 1, "variant_key": "red",  "unique_users": 1, "exposures": 2},
+    {"config_version": 1, "variant_key": "blue", "unique_users": 3, "exposures": 5}
+  ]
+}
+```
+
+- 时间窗按曝光记录固化的**原判定时间** `decided_at` 过滤（含边界）；`decided_from` / `decided_to` 为 ISO 8601 且**必须带时区**（`Z` 或 `+08:00` 等偏移，服务统一转 UTC，响应回显规范化后的生效窗口），缺省表示该方向不设限；不带时区、格式非法或区间倒置（from 晚于 to）返回 `422`；
+- `unique_users` 为组内按 `user_id` 去重的用户数，`exposures` 为组内曝光记录数（同一用户多次曝光只算一个用户，但计入多次曝光）；
+- 无曝光的开关返回空 `rows`（不返回 `404`），已删除开关的汇总同样可查。
+
 ## 分桶算法
 
 ```
@@ -656,10 +718,10 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 │   ├── segments.py    # 受众分群表达式引擎：all/any/not/condition/segment 递归解析、短路 trace、循环引用与深度校验
 │   ├── schemas.py     # Pydantic 请求/响应模型与配置校验（含分群递归表达式模型）
 │   ├── cursor.py      # 审计列表的不透明签名游标（边界 + 过滤绑定 + 高水位）
-│   ├── crud.py        # 配置、版本、override、分群、发布批次与快照持久化（含原子提交、引用保护、分页查询与索引补齐）
-│   ├── models.py      # SQLAlchemy ORM（segments / flag_configs / flag_config_versions / flag_overrides / release_batches / decision_snapshots）
+│   ├── crud.py        # 配置、版本、override、分群、发布批次、曝光与快照持久化（含原子提交、引用保护、分页查询与索引补齐）
+│   ├── models.py      # SQLAlchemy ORM（segments / flag_configs / flag_config_versions / flag_overrides / release_batches / exposures / decision_snapshots）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（176 项，含分群、override、生效窗口与发布批次用例）
+├── tests/             # pytest：引擎单测 + API 集成测试（196 项，含分群、override、生效窗口、发布批次与曝光归因用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -676,6 +738,7 @@ python -m pytest -q
 
 - 服务定位为**本地 / 单机**使用：SQLite + 单实例，未做多副本一致性；
 - 判定快照只增不删（删除开关不影响历史快照回查）；配置版本与按用户 override 随开关一并删除；
+- 曝光记录（`exposures`）只增不删：删除开关不会删除历史曝光，曝光汇总对已删除开关仍可查询；曝光固化了判定时的 `config_version` 与 `variant_key`，后续配置更新、回滚不影响已固化的归因；
 - 发布批次（`release_batches`）只增不删：`pending` 批次保留创建时的候选与预览摘要，`committed` 批次额外固化各开关提交后的新版本号；删除开关不会删除历史批次记录（其中仅存创建时的配置快照与预览，不影响线上判定）；
 - 快照保存判定时的 `config_version` 与 `decision_path`（含 override 的变体与原因）；幂等重放重建 `matched_rule` 详情时优先取该版本的历史配置，版本记录缺失（如开关被删除重建）时回退到当前版本配置；
-- 本功能上线前已存在的开关，启动时会自动为当前版本补齐一条版本记录；升级到含 override 的版本时，老库会自动给快照表补 `decision_path` 列并回填 `rule` / `bucket`；升级到含生效窗口的版本时，老库会自动给 `flag_configs` / `flag_config_versions` 补 `activation_window_json` 列（老数据为 `NULL`，视为无窗口）；升级到含受众分群的版本时，老库会自动创建 `segments` 表。以上迁移均为幂等，重复启动无副作用。
+- 本功能上线前已存在的开关，启动时会自动为当前版本补齐一条版本记录；升级到含 override 的版本时，老库会自动给快照表补 `decision_path` 列并回填 `rule` / `bucket`；升级到含生效窗口的版本时，老库会自动给 `flag_configs` / `flag_config_versions` 补 `activation_window_json` 列（老数据为 `NULL`，视为无窗口）；升级到含受众分群的版本时，老库会自动创建 `segments` 表；升级到含曝光归因的版本时，启动建表流程会自动创建 `exposures` 表（含索引）。以上迁移均为幂等，重复启动无副作用。

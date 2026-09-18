@@ -140,6 +140,38 @@ class Segment(Base):
     )
 
 
+class Exposure(Base):
+    """一次实验曝光：把判定快照的关键字段固化为不可变记录。
+
+    POST /api/v1/exposures 时按 request_id 找到判定快照，把
+    flag_key / user_id / config_version / variant_key 与原判定时间
+    decided_at 一并复制到本表；之后开关更新、回滚、删除或快照变化
+    都不影响已固化的曝光（删除开关不会删除曝光记录）。
+    exposure_id 为客户端生成的幂等键（唯一）：同一 exposure_id 重试
+    返回首次记录，指向其他 request_id 时拒绝（409）。
+    """
+
+    __tablename__ = "exposures"
+    __table_args__ = (
+        # 曝光汇总：按开关 + 原判定时间窗过滤，按版本与变体分组
+        Index("ix_exposures_flag_decided", "flag_key", "decided_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    exposure_id: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True
+    )
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    flag_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    config_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    variant_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    # 原判定时间（从判定快照固化，naive UTC），曝光汇总按此时间窗筛选
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # 曝光记录创建时间（naive UTC）
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class DecisionSnapshot(Base):
     """一次判定请求的完整快照，可按 request_id 回查。"""
 

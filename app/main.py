@@ -23,6 +23,8 @@
 - POST /api/v1/evaluate           判定（flag_key 在请求体中）
 - GET  /api/v1/decisions          判定快照审计列表（不透明游标分页 + 组合过滤）
 - GET  /api/v1/decisions/{request_id}     按 request_id 查询单条判定快照
+- POST /api/v1/exposures          实验曝光归因：把判定快照固化为曝光记录（幂等）
+- GET  /api/v1/flags/{flag_key}/exposure-summary  按版本与变体汇总曝光（去重用户数 + 曝光数）
 - GET  /healthz                   健康检查
 """
 
@@ -31,7 +33,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -46,6 +48,9 @@ from app.schemas import (
     DecisionListResponse,
     EvaluateRequest,
     EvaluateResponse,
+    ExposureCreateRequest,
+    ExposureResponse,
+    ExposureSummaryResponse,
     FlagResponse,
     FlagUpsertRequest,
     FlagVersionResponse,
@@ -941,3 +946,102 @@ def get_decision(request_id: str, db: Session = Depends(get_db)):
             status_code=status.HTTP_404_NOT_FOUND, detail=f"未找到 request_id={request_id} 的判定快照"
         )
     return _snapshot_to_response(snap)
+
+
+# ---------------------------------------------------------------------------
+# 实验曝光归因
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/v1/exposures",
+    response_model=ExposureResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_exposure(
+    req: ExposureCreateRequest, response: Response, db: Session = Depends(get_db)
+):
+    """把一次已存在的判定固化为实验曝光记录（幂等）。
+
+    - ``request_id`` 对应的判定快照不存在返回 ``404``；
+    - 仅当快照存在时，把其 ``flag_key`` / ``user_id`` / ``config_version`` /
+      ``variant_key`` 与原判定时间 ``decided_at`` 固化为曝光记录——之后开关
+      更新、回滚、删除或快照变化都不影响已固化的曝光；
+    - 同一 ``exposure_id`` 重试幂等返回首次结果（``200``，结构与首次一致）；
+      复用该 ID 指向另一 ``request_id`` 返回 ``409``。
+    """
+    snapshot = crud.get_snapshot(db, req.request_id)
+    if snapshot is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"未找到 request_id={req.request_id} 的判定快照",
+        )
+    try:
+        exposure, created = crud.create_exposure(
+            db, exposure_id=req.exposure_id, snapshot=snapshot
+        )
+    except crud.ExposureConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if not created:
+        # 幂等重放：返回首次记录，状态码 200 以区别于首次创建
+        response.status_code = status.HTTP_200_OK
+    return crud.exposure_to_response(exposure)
+
+
+@app.get(
+    "/api/v1/flags/{flag_key}/exposure-summary",
+    response_model=ExposureSummaryResponse,
+)
+def exposure_summary(
+    flag_key: str,
+    decided_from: str | None = Query(
+        default=None, description="原判定时间下界（含），ISO 8601 且必须带时区"
+    ),
+    decided_to: str | None = Query(
+        default=None, description="原判定时间上界（含），ISO 8601 且必须带时区"
+    ),
+    db: Session = Depends(get_db),
+) -> ExposureSummaryResponse:
+    """按 (config_version, variant_key) 汇总某开关的曝光：去重用户数与曝光数。
+
+    - 时间窗按曝光记录固化的原判定时间 ``decided_at`` 过滤（含边界）；
+      ``decided_from`` / ``decided_to`` 必须带时区（``Z`` 或 ``+08:00`` 等偏移，
+      服务统一转 UTC），缺省表示该方向不设限；不带时区、格式非法或区间
+      倒置（from 晚于 to）返回 ``422``；
+    - 删除开关不会删除历史曝光，已删除开关的汇总仍可正常查询（无曝光时
+      ``rows`` 为空，不返回 404）。
+    """
+
+    def _parse_dt(name: str, raw: str) -> datetime:
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{name} 必须是 ISO 8601 时间，例如 2026-09-18T08:00:00Z",
+            ) from exc
+        if dt.tzinfo is None or dt.utcoffset() is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{name} 必须带时区，例如 2026-09-18T08:00:00Z",
+            )
+        # 统一成 naive UTC 比较，与 SQLAlchemy 从 SQLite 读出的 decided_at 形态一致
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    dt_from = _parse_dt("decided_from", decided_from) if decided_from is not None else None
+    dt_to = _parse_dt("decided_to", decided_to) if decided_to is not None else None
+    if dt_from is not None and dt_to is not None and dt_from > dt_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="时间区间倒置：decided_from 不得晚于 decided_to",
+        )
+
+    rows = crud.summarize_exposures(
+        db, flag_key=flag_key, decided_from=dt_from, decided_to=dt_to
+    )
+    return ExposureSummaryResponse(
+        flag_key=flag_key,
+        decided_from=dt_from.replace(tzinfo=timezone.utc) if dt_from is not None else None,
+        decided_to=dt_to.replace(tzinfo=timezone.utc) if dt_to is not None else None,
+        rows=rows,
+    )
